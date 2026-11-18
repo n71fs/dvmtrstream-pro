@@ -1,0 +1,29 @@
+name: Upload v0.1.0 release assets
+on:
+  push:
+    branches: [release/v0.1.0]
+permissions:
+  contents: write
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v0.1.0
+      - name: Package and upload the tagged plugin
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ./dvmtrstream-pro --describe > dist/dvmtrstream-pro-0.1.0.manifest.json
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu universal-apple-darwin; do
+            name="dvmtrstream-pro-0.1.0-$target"
+            git archive --format=tar.gz --prefix="$name/" --output="dist/$name.tar.gz" HEAD README.md dvmtrstream-pro example-config.json
+          done
+          cd dist
+          sha256sum ./*.tar.gz ./*.manifest.json | sed 's|  ./|  |' > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          gh release upload v0.1.0 SHA256SUMS ./*.manifest.json ./*.tar.gz --repo "$GITHUB_REPOSITORY"
