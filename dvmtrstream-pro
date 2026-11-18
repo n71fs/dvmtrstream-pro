@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""Trunk Recorder Pro live PCM to DVMBridge UDP."""
+import base64
+import binascii
+from collections import OrderedDict, deque
+from dataclasses import dataclass, field
+import json
+import socket
+import struct
+import sys
+import threading
+import time
+
+ID = "dvmtrstream-pro"
+VERSION = "0.1.0"
+FRAME_BYTES = 320
+FRAME_MS = 20
+ID_MASK = 0xFFFFFF
+SILENCE = bytes(FRAME_BYTES)
+CALL_TOPICS = ("call.start", "call.update", "call.end")
+
+
+def integer(title, minimum, maximum, default=None):
+    schema = {"type": "integer", "title": title, "minimum": minimum, "maximum": maximum}
+    if default is not None:
+        schema["default"] = default
+    return schema
+
+
+STREAM_PROPERTIES = {
+    "shortName": {"type": "string", "title": "System (empty for all)", "x-system": True},
+    "TGID": integer("Talkgroup (0 for all)", 0, 0xFFFFFFFF),
+    "address": {"type": "string", "title": "DVMBridge host", "minLength": 1},
+    "port": integer("DVMBridge UDP port", 1, 65535),
+    "destinationId": integer("Override talkgroup ID in UDP packets", 0, ID_MASK),
+    "sourceId": integer("Override DVM source radio ID", 0, ID_MASK),
+}
+TIMING_PROPERTIES = {
+    "silenceLeader": integer("Silence before each call (ms)", 0, 1000, 0),
+    "interCallDelay": integer("Minimum pause after a call (ms)", 0, 5000, 400),
+    "callGapHoldMs": integer("Call timeout without audio (ms)", 40, 5000, 250),
+    "maxQueueMs": integer("Maximum buffered audio age (ms)", 100, 10000, 1500),
+}
+MANIFEST = {
+    "id": ID, "name": "DVMBridge live stream", "version": VERSION,
+    "description": "Send live call audio and radio IDs to DVMBridge over UDP.",
+    "api": 1, "subscribe": [*CALL_TOPICS, "audio"], "audio_formats": [],
+    "config": {
+        "type": "object",
+        "required": ["streams"],
+        "properties": {
+            "streams": {
+                "type": "array", "title": "Streams", "minItems": 1, "maxItems": 64,
+                "items": {
+                    "type": "object", "title": "Stream",
+                    "required": ["TGID", "address", "port"],
+                    "properties": STREAM_PROPERTIES,
+                },
+            },
+            **TIMING_PROPERTIES,
+        },
+    },
+}
+
+
+def setting(config, name, schema, context="Settings"):
+    value = config.get(name, schema.get("default"))
+    if schema["type"] == "integer":
+        if type(value) is not int or not schema["minimum"] <= value <= schema["maximum"]:
+            raise ValueError(f"{context}: {name} must be an integer from "
+                             f"{schema['minimum']} to {schema['maximum']}.")
+    elif not isinstance(value, str) or len(value.strip()) < schema.get("minLength", 0):
+        raise ValueError(f"{context}: enter a valid {name}.")
+    return value.strip() if isinstance(value, str) else value
+
+
+@dataclass(frozen=True)
+class Route:
+    system: str
+    talkgroup: int
+    destination: int | None
+    source: int | None
+
+    def matches(self, system, talkgroups):
+        return (not self.system or self.system == system) and (
+            self.talkgroup == 0 or self.talkgroup in talkgroups
+        )
+
+
+def packet(pcm, ids):
+    destination, source = ids
+    return (
+        struct.pack(">I", FRAME_BYTES)
+        + pcm.ljust(FRAME_BYTES, b"\x00")
+        + struct.pack(">II", destination & ID_MASK, source & ID_MASK)
+    )
+
+
+@dataclass
+class CallAudio:
+    last_audio: float
+    frames: deque = field(default_factory=deque)
+    partial: bytes = b""
+    partial_at: float = 0.0
+    ids: tuple = (0, 0)
+    ended: bool = False
+
+
+class Endpoint:
+    def __init__(self, sock, address, timing):
+        self.socket = sock
+        self.address = address
+        host, port = address[:2]
+        self.name = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+        self.routes = []
+        self.calls = OrderedDict()
+        self.active = None
+        self.ready_at = 0.0
+        self.leader = (timing["silenceLeader"] + FRAME_MS - 1) // FRAME_MS
+        self.leader_left = 0
+        self.pause = timing["interCallDelay"] / 1000
+        self.hold = timing["callGapHoldMs"] / 1000
+        self.max_age = timing["maxQueueMs"] / 1000
+        self.capacity = timing["maxQueueMs"] // FRAME_MS
+        self.queued = 0
+        self.dropped = 0
+        self.sent = 0
+        self.errors = 0
+        self.last_error = ""
+        self.last_ok = None
+
+    def push(self, call, data, ids, created):
+        if self.queued >= self.capacity:
+            self.dropped += 1
+            return
+        call.frames.append((created, packet(data, ids), ids))
+        self.queued += 1
+
+    def flush(self, call):
+        if call.partial:
+            self.push(call, call.partial, call.ids, call.partial_at)
+            call.partial = b""
+
+    def offer(self, key, pcm, ids, now):
+        call = self.calls.get(key)
+        if call is None:
+            if len(self.calls) >= self.capacity:
+                self.dropped += (len(pcm) + FRAME_BYTES - 1) // FRAME_BYTES
+                return
+            call = self.calls[key] = CallAudio(now)
+
+        if call.ids != ids:
+            self.flush(call)
+        created = call.partial_at if call.partial else now
+        data = call.partial + pcm
+        call.ids = ids
+        call.last_audio = now
+        stop = len(data) - len(data) % FRAME_BYTES
+        for offset in range(0, stop, FRAME_BYTES):
+            self.push(call, data[offset:offset + FRAME_BYTES], ids, created)
+            created = now
+        call.partial = data[stop:]
+        call.partial_at = created
+
+    def end(self, key):
+        call = self.calls.get(key)
+        if call is not None:
+            call.ended = True
+            self.flush(call)
+
+    def expire(self, now):
+        for key, call in list(self.calls.items()):
+            finished = call.ended or now - call.last_audio >= self.hold
+            if call.partial and now - call.partial_at >= self.max_age:
+                call.partial = b""
+                self.dropped += 1
+            if finished:
+                self.flush(call)
+            while call.frames and now - call.frames[0][0] >= self.max_age:
+                call.frames.popleft()
+                self.queued -= 1
+                self.dropped += 1
+            if finished and not call.frames:
+                del self.calls[key]
+                if self.active == key:
+                    self.active = None
+                    self.ready_at = now + self.pause
+
+    def tick(self, now):
+        self.expire(now)
+        if now < self.ready_at:
+            return
+        if self.active is None:
+            key = next((key for key, call in self.calls.items() if call.frames), None)
+            if key is None:
+                return
+            self.active = key
+            self.leader_left = self.leader
+
+        call = self.calls[self.active]
+        if not call.frames:
+            return
+        if self.leader_left:
+            self.leader_left -= 1
+            data = packet(SILENCE, call.frames[0][2])
+        else:
+            _, data, _ = call.frames.popleft()
+            self.queued -= 1
+        try:
+            self.sent += self.socket.sendto(data, self.address)
+        except OSError as error:
+            self.errors += 1
+            self.last_error = str(error)
+        else:
+            self.last_error = ""
+            self.last_ok = time.time()
+
+    def health(self):
+        endpoint = {
+            "name": self.name,
+            "state": "down" if self.last_error else "up" if self.sent else "unknown",
+        }
+        if self.last_error:
+            endpoint["lastError"] = self.last_error
+        if self.last_ok is not None:
+            endpoint["lastOk"] = self.last_ok
+        return endpoint
+
+
+def open_endpoints(config):
+    if not isinstance(config, dict):
+        raise ValueError("Add at least one DVMBridge stream in plugin settings.")
+    streams = config.get("streams")
+    if not isinstance(streams, list) or not 1 <= len(streams) <= 64:
+        raise ValueError("Configure between 1 and 64 DVMBridge streams.")
+    timing = {name: setting(config, name, schema) for name, schema in TIMING_PROPERTIES.items()}
+    leader_ms = ((timing["silenceLeader"] + FRAME_MS - 1) // FRAME_MS) * FRAME_MS
+    if timing["maxQueueMs"] <= leader_ms:
+        raise ValueError("maxQueueMs must be greater than the rounded silenceLeader duration.")
+
+    endpoints = {}
+    try:
+        for index, stream in enumerate(streams, 1):
+            context = f"Stream {index}"
+            if not isinstance(stream, dict):
+                raise ValueError(f"{context}: expected an object.")
+            values = {
+                name: setting(stream, name, schema, context)
+                for name, schema in STREAM_PROPERTIES.items()
+                if name in stream or name in ("TGID", "address", "port")
+            }
+            host = values["address"]
+            if host.startswith("[") and host.endswith("]"):
+                host = host[1:-1]
+            try:
+                family, socktype, protocol, _, address = socket.getaddrinfo(
+                    host, values["port"], type=socket.SOCK_DGRAM
+                )[0]
+                key = (family, address)
+                if key not in endpoints:
+                    sock = socket.socket(family, socktype, protocol)
+                    sock.setblocking(False)
+                    endpoints[key] = Endpoint(sock, address, timing)
+            except OSError as error:
+                raise ValueError(f"{context}: could not open {values['address']}:"
+                                 f"{values['port']} ({error}).") from error
+            endpoints[key].routes.append(Route(
+                values.get("shortName", ""), values["TGID"],
+                values.get("destinationId"), values.get("sourceId"),
+            ))
+    except ValueError:
+        for endpoint in endpoints.values():
+            endpoint.socket.close()
+        raise
+    return list(endpoints.values())
+
+
+def send_message(kind, **payload):
+    print(json.dumps({"type": kind, **payload}, separators=(",", ":")), flush=True)
+
+
+def unsigned(value):
+    return value if type(value) is int and value >= 0 else 0
+
+
+class Relay:
+    def __init__(self, endpoints, systems):
+        self.endpoints = endpoints
+        self.systems = {system["index"]: system["short_name"] for system in systems}
+        self.metadata = OrderedDict()
+        self.invalid_audio = 0
+        self.lock = threading.Lock()
+        self.stopped = threading.Event()
+        self.worker = threading.Thread(target=self.run, daemon=True)
+
+    def event(self, message):
+        kind = message.get("type")
+        system = message.get("short_name") or self.systems.get(message.get("system"), "")
+        with self.lock:
+            if kind == "audio":
+                self.audio(message, system)
+            elif kind in CALL_TOPICS:
+                key = (system, message["id"])
+                if kind == "call.end":
+                    self.metadata.pop(key, None)
+                    for endpoint in self.endpoints:
+                        endpoint.end(key)
+                else:
+                    self.metadata[key] = message
+                    self.metadata.move_to_end(key)
+                    if len(self.metadata) > 4096:
+                        self.metadata.popitem(last=False)
+
+    def audio(self, message, system):
+        key = (system, message["call_id"])
+        talkgroup = unsigned(message.get("talkgroup"))
+        call = self.metadata.get(key)
+        if call is None:
+            # TR Pro emits lifecycle events under the first site's call ID.
+            twins = [
+                (other, meta) for other, meta in self.metadata.items()
+                if other[0] == system and meta.get("talkgroup") == talkgroup
+            ]
+            if len(twins) == 1:
+                key, call = twins[0]
+        call = call or {}
+        groups = {talkgroup, unsigned(call.get("talkgroup", talkgroup))}
+        groups.update(call.get("patched_talkgroups", []))
+        units = call.get("sources", [])
+        source = unsigned(units[-1].get("unit")) if units else 0
+        if not source and call.get("units"):
+            source = unsigned(call["units"][-1])
+
+        targets = []
+        for endpoint in self.endpoints:
+            route = next((r for r in endpoint.routes if r.matches(system, groups)), None)
+            if route is not None:
+                ids = (
+                    talkgroup if route.destination is None else route.destination,
+                    source if route.source is None else route.source,
+                )
+                targets.append((endpoint, ids))
+        if not targets:
+            return
+        try:
+            pcm = base64.b64decode(message.get("pcm", ""), validate=True)
+        except (binascii.Error, ValueError, TypeError):
+            self.invalid_audio += 1
+            return
+        if message.get("sample_rate") != 8000 or len(pcm) % 2 or not pcm:
+            self.invalid_audio += 1
+            return
+        now = time.monotonic()
+        for endpoint, ids in targets:
+            endpoint.offer(key, pcm, ids, now)
+
+    def run(self):
+        interval = FRAME_MS / 1000
+        next_tick = time.monotonic()
+        report_at = 0.0
+        previous_state = None
+        while not self.stopped.is_set():
+            now = time.monotonic()
+            with self.lock:
+                for endpoint in self.endpoints:
+                    endpoint.tick(now)
+                if now >= report_at:
+                    metrics = {
+                        "bytesSent": sum(endpoint.sent for endpoint in self.endpoints),
+                        "endpoints": [endpoint.health() for endpoint in self.endpoints],
+                        "extra": {
+                            "Buffered UDP frames": sum(e.queued for e in self.endpoints),
+                            "Dropped or expired frames": sum(e.dropped for e in self.endpoints),
+                            "UDP send errors": sum(e.errors for e in self.endpoints),
+                            "Invalid audio chunks": self.invalid_audio,
+                        },
+                    }
+            if now >= report_at:
+                failed = [e["name"] for e in metrics["endpoints"] if e["state"] == "down"]
+                state = ("warning", "UDP send failed for " + ", ".join(failed)) if failed else (
+                    "ok", f"Configured {len(self.endpoints)} UDP destination(s)"
+                )
+                if state != previous_state:
+                    send_message("status", state=state[0], message=state[1])
+                    previous_state = state
+                send_message("metrics", **metrics)
+                report_at = now + 2
+            next_tick += interval
+            after = time.monotonic()
+            if next_tick - after < interval / 2:
+                next_tick = after + interval
+            self.stopped.wait(next_tick - after)
+
+    def close(self):
+        self.stopped.set()
+        self.worker.join(timeout=0.25)
+        if not self.worker.is_alive():
+            for endpoint in self.endpoints:
+                endpoint.socket.close()
+
+
+def main():
+    if sys.argv[1:] == ["--describe"]:
+        print(json.dumps(MANIFEST))
+        return 0
+    if sys.argv[1:] == ["--version"]:
+        print(f"{ID} {VERSION}")
+        return 0
+    if sys.argv[1:]:
+        print(f"Usage: {ID} [--describe | --version]", file=sys.stderr)
+        return 2
+
+    try:
+        hello = json.loads(sys.stdin.readline())
+        if not isinstance(hello, dict) or hello.get("type") != "hello" or hello.get("api") != 1:
+            raise ValueError("Expected a Trunk Recorder Pro hello with plugin API 1.")
+        relay = Relay(open_endpoints(hello.get("config")), hello.get("systems", []))
+    except ValueError as error:
+        send_message("status", state="error", message=str(error))
+        return 78
+
+    send_message("ready")
+    relay.worker.start()
+    try:
+        for line in sys.stdin:
+            try:
+                message = json.loads(line)
+                if not isinstance(message, dict):
+                    continue
+                if message.get("type") == "shutdown":
+                    break
+                relay.event(message)
+            except (ValueError, TypeError, KeyError, AttributeError):
+                send_message("log", level="warn", message="Ignored an invalid plugin event.")
+    finally:
+        relay.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,26 @@
+{
+  "plugins": {
+    "dvmtrstream-pro": {
+      "enabled": true,
+      "path": "/home/radio/.local/bin/dvmtrstream-pro",
+      "shareDecrypted": false,
+      "settings": {
+        "streams": [
+          {
+            "shortName": "county",
+            "TGID": 3101,
+            "address": "127.0.0.1",
+            "port": 32001
+          },
+          {
+            "shortName": "county",
+            "TGID": 3102,
+            "address": "127.0.0.1",
+            "port": 32002,
+            "sourceId": 1234567
+          }
+        ]
+      }
+    }
+  }
+}
