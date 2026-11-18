@@ -1,0 +1,22 @@
+name: Verify v0.1.0 installation
+on:
+  push:
+    branches: [release/v0.1.0]
+permissions:
+  contents: read
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install the public plugin release with TR Pro 0.3.8
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=trunk-pro-0.3.8-linux-x86_64.tar.gz
+          curl --fail --silent --show-error --location --retry 3 --output "$archive" "https://github.com/TrunkRecorder/trunk-recorder-pro/releases/download/v0.3.8/$archive"
+          printf '%s  %s\n' b05de4fd03089355ba6b02b8bea253287ed88edb9be794bedf085e73e9599101 "$archive" | sha256sum -c -
+          tar -xzf "$archive" trunk-pro-0.3.8-linux-x86_64/trunk-pro
+          trp=./trunk-pro-0.3.8-linux-x86_64/trunk-pro
+          "$trp" plugin install "https://github.com/$GITHUB_REPOSITORY" --tag v0.1.0 --config "$RUNNER_TEMP/config.json"
+          "$RUNNER_TEMP/plugins/dvmtrstream-pro/dvmtrstream-pro" --version
+          "$trp" plugin list --config "$RUNNER_TEMP/config.json"
